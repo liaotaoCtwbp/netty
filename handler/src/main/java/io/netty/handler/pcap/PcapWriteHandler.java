@@ -5,7 +5,7 @@
  * version 2.0 (the "License"); you may not use this file except in compliance
  * with the License. You may obtain a copy of the License at:
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ * https://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
@@ -31,6 +31,7 @@ import io.netty.util.internal.ObjectUtil;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
+import java.io.Closeable;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.Inet4Address;
@@ -61,8 +62,11 @@ import java.net.InetSocketAddress;
  *    </ul>
  * </p>
  */
-public final class PcapWriteHandler extends ChannelDuplexHandler {
+public final class PcapWriteHandler extends ChannelDuplexHandler implements Closeable {
 
+    /**
+     * Logger for logging events
+     */
     private final InternalLogger logger = InternalLoggerFactory.getInstance(PcapWriteHandler.class);
 
     /**
@@ -99,24 +103,44 @@ public final class PcapWriteHandler extends ChannelDuplexHandler {
     private int receiveSegmentNumber = 1;
 
     /**
-     * Source Address
+     * Type of the channel this handler is registered on
      */
-    private InetSocketAddress srcAddr;
+    private ChannelType channelType;
 
     /**
-     * Destination Address
+     * Address of the initiator of the connection
      */
-    private InetSocketAddress dstAddr;
+    private InetSocketAddress initiatiorAddr;
+
+    /**
+     * Address of the receiver of the connection
+     */
+    private InetSocketAddress handlerAddr;
+
+    private boolean isServerPipeline;
+
+    /**
+     * Set to {@code true} if {@link #close()} is called and we should stop writing Pcap.
+     */
+    private boolean isClosed;
+
+    /**
+     * Whether this handler is initialized (headers written, channel type inferred)
+     */
+    private boolean initialized;
 
     /**
      * Create new {@link PcapWriteHandler} Instance.
      * {@code captureZeroByte} is set to {@code false} and
      * {@code writePcapGlobalHeader} is set to {@code true}.
      *
-     * @param outputStream OutputStream where Pcap data will be written
+     * @param outputStream OutputStream where Pcap data will be written. Call {@link #close()} to close this
+     *                     OutputStream.
      * @throws NullPointerException If {@link OutputStream} is {@code null} then we'll throw an
      *                              {@link NullPointerException}
+     * @deprecated Use {@link #builder() builder} instead.
      */
+    @Deprecated
     public PcapWriteHandler(OutputStream outputStream) {
         this(outputStream, false, true);
     }
@@ -124,7 +148,8 @@ public final class PcapWriteHandler extends ChannelDuplexHandler {
     /**
      * Create new {@link PcapWriteHandler} Instance
      *
-     * @param outputStream          OutputStream where Pcap data will be written
+     * @param outputStream          OutputStream where Pcap data will be written. Call {@link #close()} to close this
+     *                              OutputStream.
      * @param captureZeroByte       Set to {@code true} to enable capturing packets with empty (0 bytes) payload.
      *                              Otherwise, if set to {@code false}, empty packets will be filtered out.
      * @param writePcapGlobalHeader Set to {@code true} to write Pcap Global Header on initialization.
@@ -133,15 +158,33 @@ public final class PcapWriteHandler extends ChannelDuplexHandler {
      *                              Pcap Global Header is already present.
      * @throws NullPointerException If {@link OutputStream} is {@code null} then we'll throw an
      *                              {@link NullPointerException}
+     * @deprecated Use {@link #builder() builder} instead.
      */
+    @Deprecated
     public PcapWriteHandler(OutputStream outputStream, boolean captureZeroByte, boolean writePcapGlobalHeader) {
         this.outputStream = ObjectUtil.checkNotNull(outputStream, "OutputStream");
         this.captureZeroByte = captureZeroByte;
         this.writePcapGlobalHeader = writePcapGlobalHeader;
     }
 
-    @Override
-    public void channelActive(ChannelHandlerContext ctx) throws Exception {
+    private PcapWriteHandler(Builder builder, OutputStream outputStream) {
+        this.outputStream = outputStream;
+        this.captureZeroByte = builder.captureZeroByte;
+        this.writePcapGlobalHeader = builder.writePcapGlobalHeader;
+        this.channelType = builder.channelType;
+        this.handlerAddr = builder.handlerAddr;
+        this.initiatiorAddr = builder.initiatiorAddr;
+        this.isServerPipeline = builder.isServerPipeline;
+    }
+
+    public static Builder builder() {
+        return new Builder();
+    }
+
+    private void initializeIfNecessary(ChannelHandlerContext ctx) {
+        if (initialized) {
+            return;
+        }
 
         ByteBufAllocator byteBufAllocator = ctx.alloc();
 
@@ -164,76 +207,108 @@ public final class PcapWriteHandler extends ChannelDuplexHandler {
             this.pCapWriter = new PcapWriter(this.outputStream);
         }
 
-        // If Channel belongs to `SocketChannel` then we're handling TCP.
-        if (ctx.channel() instanceof SocketChannel) {
+        if (channelType == null) {
+            // infer channel type
+            if (ctx.channel() instanceof SocketChannel) {
+                channelType = ChannelType.TCP;
 
-            // Capture correct `localAddress` and `remoteAddress`
-            if (ctx.channel().parent() instanceof ServerSocketChannel) {
-                srcAddr = (InetSocketAddress) ctx.channel().remoteAddress();
-                dstAddr = (InetSocketAddress) ctx.channel().localAddress();
-            } else {
-                srcAddr = (InetSocketAddress) ctx.channel().localAddress();
-                dstAddr = (InetSocketAddress) ctx.channel().remoteAddress();
+                // If Channel belongs to `SocketChannel` then we're handling TCP.
+                // Capture correct `localAddress` and `remoteAddress`
+                if (ctx.channel().parent() instanceof ServerSocketChannel) {
+                    isServerPipeline = true;
+                    initiatiorAddr = (InetSocketAddress) ctx.channel().remoteAddress();
+                    handlerAddr = (InetSocketAddress) ctx.channel().localAddress();
+                } else {
+                    isServerPipeline = false;
+                    initiatiorAddr = (InetSocketAddress) ctx.channel().localAddress();
+                    handlerAddr = (InetSocketAddress) ctx.channel().remoteAddress();
+                }
+            } else if (ctx.channel() instanceof DatagramChannel) {
+                channelType = ChannelType.UDP;
+
+                DatagramChannel datagramChannel = (DatagramChannel) ctx.channel();
+
+                // If `DatagramChannel` is connected then we can get
+                // `localAddress` and `remoteAddress` from Channel.
+                if (datagramChannel.isConnected()) {
+                    initiatiorAddr = (InetSocketAddress) ctx.channel().localAddress();
+                    handlerAddr = (InetSocketAddress) ctx.channel().remoteAddress();
+                }
             }
+        }
 
+        if (channelType == ChannelType.TCP) {
             logger.debug("Initiating Fake TCP 3-Way Handshake");
 
             ByteBuf tcpBuf = byteBufAllocator.buffer();
 
             try {
                 // Write SYN with Normal Source and Destination Address
-                TCPPacket.writePacket(tcpBuf, null, 0, 0, srcAddr.getPort(), dstAddr.getPort(), TCPPacket.TCPFlag.SYN);
-                completeTCPWrite(srcAddr, dstAddr, tcpBuf, byteBufAllocator, ctx);
+                TCPPacket.writePacket(tcpBuf, null, 0, 0,
+                        initiatiorAddr.getPort(), handlerAddr.getPort(), TCPPacket.TCPFlag.SYN);
+                completeTCPWrite(initiatiorAddr, handlerAddr, tcpBuf, byteBufAllocator, ctx);
 
                 // Write SYN+ACK with Reversed Source and Destination Address
-                TCPPacket.writePacket(tcpBuf, null, 0, 1, dstAddr.getPort(), srcAddr.getPort(), TCPPacket.TCPFlag.SYN,
-                        TCPPacket.TCPFlag.ACK);
-                completeTCPWrite(dstAddr, srcAddr, tcpBuf, byteBufAllocator, ctx);
+                TCPPacket.writePacket(tcpBuf, null, 0, 1,
+                        handlerAddr.getPort(), initiatiorAddr.getPort(), TCPPacket.TCPFlag.SYN, TCPPacket.TCPFlag.ACK);
+                completeTCPWrite(handlerAddr, initiatiorAddr, tcpBuf, byteBufAllocator, ctx);
 
                 // Write ACK with Normal Source and Destination Address
-                TCPPacket.writePacket(tcpBuf, null, 1, 1, srcAddr.getPort(), dstAddr.getPort(), TCPPacket.TCPFlag.ACK);
-                completeTCPWrite(srcAddr, dstAddr, tcpBuf, byteBufAllocator, ctx);
+                TCPPacket.writePacket(tcpBuf, null, 1, 1, initiatiorAddr.getPort(),
+                        handlerAddr.getPort(), TCPPacket.TCPFlag.ACK);
+                completeTCPWrite(initiatiorAddr, handlerAddr, tcpBuf, byteBufAllocator, ctx);
             } finally {
                 tcpBuf.release();
             }
 
             logger.debug("Finished Fake TCP 3-Way Handshake");
-        } else if (ctx.channel() instanceof DatagramChannel) {
-            DatagramChannel datagramChannel = (DatagramChannel) ctx.channel();
-
-            // If `DatagramChannel` is connected then we can get
-            // `localAddress` and `remoteAddress` from Channel.
-            if (datagramChannel.isConnected()) {
-                srcAddr = (InetSocketAddress) ctx.channel().localAddress();
-                dstAddr = (InetSocketAddress) ctx.channel().remoteAddress();
-            }
         }
 
+        initialized = true;
+    }
+
+    @Override
+    public void channelActive(ChannelHandlerContext ctx) throws Exception {
+        initializeIfNecessary(ctx);
         super.channelActive(ctx);
     }
 
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
-        if (ctx.channel() instanceof SocketChannel) {
-            handleTCP(ctx, msg, false);
-        } else if (ctx.channel() instanceof DatagramChannel) {
-            handleUDP(ctx, msg);
-        } else {
-            logger.debug("Discarding Pcap Write for Unknown Channel Type: {}", ctx.channel());
+        if (!isClosed) {
+            initializeIfNecessary(ctx);
+
+            if (channelType == ChannelType.TCP) {
+                handleTCP(ctx, msg, false);
+            } else if (channelType == ChannelType.UDP) {
+                handleUDP(ctx, msg);
+            } else {
+                logDiscard();
+            }
         }
         super.channelRead(ctx, msg);
     }
 
     @Override
     public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception {
-        if (ctx.channel() instanceof SocketChannel) {
-            handleTCP(ctx, msg, true);
-        } else if (ctx.channel() instanceof DatagramChannel) {
-            handleUDP(ctx, msg);
-        } else {
-            logger.debug("Discarding Pcap Write for Unknown Channel Type: {}", ctx.channel());
+        if (!isClosed) {
+            initializeIfNecessary(ctx);
+
+            if (channelType == ChannelType.TCP) {
+                handleTCP(ctx, msg, true);
+            } else if (channelType == ChannelType.UDP) {
+                handleUDP(ctx, msg);
+            } else {
+                logDiscard();
+            }
         }
         super.write(ctx, msg, promise);
+    }
+
+    private void logDiscard() {
+        logger.warn("Discarding pcap write because channel type is unknown. The channel this handler is registered " +
+                "on is not a SocketChannel or DatagramChannel, so the inference does not work. Please call " +
+                "forceTcpChannel or forceUdpChannel before registering the handler.");
     }
 
     /**
@@ -261,6 +336,16 @@ public final class PcapWriteHandler extends ChannelDuplexHandler {
 
             try {
                 if (isWriteOperation) {
+                    final InetSocketAddress srcAddr;
+                    final InetSocketAddress dstAddr;
+                    if (isServerPipeline) {
+                        srcAddr = handlerAddr;
+                        dstAddr = initiatiorAddr;
+                    } else {
+                        srcAddr = initiatiorAddr;
+                        dstAddr = handlerAddr;
+                    }
+
                     TCPPacket.writePacket(tcpBuf, packet, sendSegmentNumber, receiveSegmentNumber, srcAddr.getPort(),
                             dstAddr.getPort(), TCPPacket.TCPFlag.ACK);
                     completeTCPWrite(srcAddr, dstAddr, tcpBuf, byteBufAllocator, ctx);
@@ -273,17 +358,27 @@ public final class PcapWriteHandler extends ChannelDuplexHandler {
                     completeTCPWrite(dstAddr, srcAddr, tcpBuf, byteBufAllocator, ctx);
                     logTCP(true, bytes, sendSegmentNumber, receiveSegmentNumber, dstAddr, srcAddr, true);
                 } else {
-                    TCPPacket.writePacket(tcpBuf, packet, receiveSegmentNumber, sendSegmentNumber, dstAddr.getPort(),
-                            srcAddr.getPort(), TCPPacket.TCPFlag.ACK);
-                    completeTCPWrite(dstAddr, srcAddr, tcpBuf, byteBufAllocator, ctx);
-                    logTCP(false, bytes, receiveSegmentNumber, sendSegmentNumber, dstAddr, srcAddr, false);
+                    final InetSocketAddress srcAddr;
+                    final InetSocketAddress dstAddr;
+                    if (isServerPipeline) {
+                        srcAddr = initiatiorAddr;
+                        dstAddr = handlerAddr;
+                    } else {
+                        srcAddr = handlerAddr;
+                        dstAddr = initiatiorAddr;
+                    }
+
+                    TCPPacket.writePacket(tcpBuf, packet, receiveSegmentNumber, sendSegmentNumber, srcAddr.getPort(),
+                            dstAddr.getPort(), TCPPacket.TCPFlag.ACK);
+                    completeTCPWrite(srcAddr, dstAddr, tcpBuf, byteBufAllocator, ctx);
+                    logTCP(false, bytes, receiveSegmentNumber, sendSegmentNumber, srcAddr, dstAddr, false);
 
                     receiveSegmentNumber += bytes;
 
-                    TCPPacket.writePacket(tcpBuf, null, sendSegmentNumber, receiveSegmentNumber, srcAddr.getPort(),
-                            dstAddr.getPort(), TCPPacket.TCPFlag.ACK);
-                    completeTCPWrite(srcAddr, dstAddr, tcpBuf, byteBufAllocator, ctx);
-                    logTCP(false, bytes, sendSegmentNumber, receiveSegmentNumber, srcAddr, dstAddr, true);
+                    TCPPacket.writePacket(tcpBuf, null, sendSegmentNumber, receiveSegmentNumber, dstAddr.getPort(),
+                            srcAddr.getPort(), TCPPacket.TCPFlag.ACK);
+                    completeTCPWrite(dstAddr, srcAddr, tcpBuf, byteBufAllocator, ctx);
+                    logTCP(false, bytes, sendSegmentNumber, receiveSegmentNumber, dstAddr, srcAddr, true);
                 }
             } finally {
                 tcpBuf.release();
@@ -364,7 +459,7 @@ public final class PcapWriteHandler extends ChannelDuplexHandler {
      *
      * @param ctx {@link ChannelHandlerContext} for {@code localAddress} / {@code remoteAddress},
      *            {@link ByteBuf} allocation and {@code fireExceptionCaught}
-     * @param msg {@link DatagramPacket} or {@link DatagramChannel}
+     * @param msg {@link DatagramPacket} or {@link ByteBuf}
      */
     private void handleUDP(ChannelHandlerContext ctx, Object msg) {
         ByteBuf udpBuf = ctx.alloc().buffer();
@@ -393,7 +488,8 @@ public final class PcapWriteHandler extends ChannelDuplexHandler {
 
                 UDPPacket.writePacket(udpBuf, datagramPacket.content(), srcAddr.getPort(), dstAddr.getPort());
                 completeUDPWrite(srcAddr, dstAddr, udpBuf, ctx.alloc(), ctx);
-            } else if (msg instanceof ByteBuf && ((DatagramChannel) ctx.channel()).isConnected()) {
+            } else if (msg instanceof ByteBuf &&
+                    (!(ctx.channel() instanceof DatagramChannel) || ((DatagramChannel) ctx.channel()).isConnected())) {
 
                 // If bytes are 0 and `captureZeroByte` is false, we won't capture this.
                 if (((ByteBuf) msg).readableBytes() == 0 && !captureZeroByte) {
@@ -404,10 +500,10 @@ public final class PcapWriteHandler extends ChannelDuplexHandler {
                 ByteBuf byteBuf = ((ByteBuf) msg).duplicate();
 
                 logger.debug("Writing UDP Data of {} Bytes, Src Addr {}, Dst Addr {}",
-                        byteBuf.readableBytes(), srcAddr, dstAddr);
+                        byteBuf.readableBytes(), initiatiorAddr, handlerAddr);
 
-                UDPPacket.writePacket(udpBuf, byteBuf, srcAddr.getPort(), dstAddr.getPort());
-                completeUDPWrite(srcAddr, dstAddr, udpBuf, ctx.alloc(), ctx);
+                UDPPacket.writePacket(udpBuf, byteBuf, initiatiorAddr.getPort(), handlerAddr.getPort());
+                completeUDPWrite(initiatiorAddr, handlerAddr, udpBuf, ctx.alloc(), ctx);
             } else {
                 logger.debug("Discarding Pcap Write for UDP Object: {}", msg);
             }
@@ -467,7 +563,7 @@ public final class PcapWriteHandler extends ChannelDuplexHandler {
     public void handlerRemoved(ChannelHandlerContext ctx) throws Exception {
 
         // If `isTCP` is true, then we'll simulate a `FIN` flow.
-        if (ctx.channel() instanceof SocketChannel) {
+        if (channelType == ChannelType.TCP) {
             logger.debug("Starting Fake TCP FIN+ACK Flow to close connection");
 
             ByteBufAllocator byteBufAllocator = ctx.alloc();
@@ -475,19 +571,19 @@ public final class PcapWriteHandler extends ChannelDuplexHandler {
 
             try {
                 // Write FIN+ACK with Normal Source and Destination Address
-                TCPPacket.writePacket(tcpBuf, null, sendSegmentNumber, receiveSegmentNumber, srcAddr.getPort(),
-                        dstAddr.getPort(), TCPPacket.TCPFlag.FIN, TCPPacket.TCPFlag.ACK);
-                completeTCPWrite(srcAddr, dstAddr, tcpBuf, byteBufAllocator, ctx);
+                TCPPacket.writePacket(tcpBuf, null, sendSegmentNumber, receiveSegmentNumber, initiatiorAddr.getPort(),
+                        handlerAddr.getPort(), TCPPacket.TCPFlag.FIN, TCPPacket.TCPFlag.ACK);
+                completeTCPWrite(initiatiorAddr, handlerAddr, tcpBuf, byteBufAllocator, ctx);
 
                 // Write FIN+ACK with Reversed Source and Destination Address
-                TCPPacket.writePacket(tcpBuf, null, receiveSegmentNumber, sendSegmentNumber, dstAddr.getPort(),
-                        srcAddr.getPort(), TCPPacket.TCPFlag.FIN, TCPPacket.TCPFlag.ACK);
-                completeTCPWrite(dstAddr, srcAddr, tcpBuf, byteBufAllocator, ctx);
+                TCPPacket.writePacket(tcpBuf, null, receiveSegmentNumber, sendSegmentNumber, handlerAddr.getPort(),
+                        initiatiorAddr.getPort(), TCPPacket.TCPFlag.FIN, TCPPacket.TCPFlag.ACK);
+                completeTCPWrite(handlerAddr, initiatiorAddr, tcpBuf, byteBufAllocator, ctx);
 
                 // Write ACK with Normal Source and Destination Address
                 TCPPacket.writePacket(tcpBuf, null, sendSegmentNumber + 1, receiveSegmentNumber + 1,
-                        srcAddr.getPort(), dstAddr.getPort(), TCPPacket.TCPFlag.ACK);
-                completeTCPWrite(srcAddr, dstAddr, tcpBuf, byteBufAllocator, ctx);
+                        initiatiorAddr.getPort(), handlerAddr.getPort(), TCPPacket.TCPFlag.ACK);
+                completeTCPWrite(initiatiorAddr, handlerAddr, tcpBuf, byteBufAllocator, ctx);
             } finally {
                 tcpBuf.release();
             }
@@ -495,21 +591,21 @@ public final class PcapWriteHandler extends ChannelDuplexHandler {
             logger.debug("Finished Fake TCP FIN+ACK Flow to close connection");
         }
 
-        this.pCapWriter.close();
+        close();
         super.handlerRemoved(ctx);
     }
 
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
 
-        if (ctx.channel() instanceof SocketChannel) {
+        if (channelType == ChannelType.TCP) {
             ByteBuf tcpBuf = ctx.alloc().buffer();
 
             try {
                 // Write RST with Normal Source and Destination Address
-                TCPPacket.writePacket(tcpBuf, null, sendSegmentNumber, receiveSegmentNumber, srcAddr.getPort(),
-                        dstAddr.getPort(), TCPPacket.TCPFlag.RST, TCPPacket.TCPFlag.ACK);
-                completeTCPWrite(srcAddr, dstAddr, tcpBuf, ctx.alloc(), ctx);
+                TCPPacket.writePacket(tcpBuf, null, sendSegmentNumber, receiveSegmentNumber, initiatiorAddr.getPort(),
+                        handlerAddr.getPort(), TCPPacket.TCPFlag.RST, TCPPacket.TCPFlag.ACK);
+                completeTCPWrite(initiatiorAddr, handlerAddr, tcpBuf, ctx.alloc(), ctx);
             } finally {
                 tcpBuf.release();
             }
@@ -517,7 +613,119 @@ public final class PcapWriteHandler extends ChannelDuplexHandler {
             logger.debug("Sent Fake TCP RST to close connection");
         }
 
-        this.pCapWriter.close();
+        close();
         ctx.fireExceptionCaught(cause);
+    }
+
+    /**
+     * <p> Close {@code PcapWriter} and {@link OutputStream}. </p>
+     * <p> Note: Calling this method does not close {@link PcapWriteHandler}.
+     * Only Pcap Writes are closed. </p>
+     *
+     * @throws IOException If {@link OutputStream#close()} throws an exception
+     */
+    @Override
+    public void close() throws IOException {
+        if (isClosed) {
+            logger.debug("PcapWriterHandler is already closed");
+        } else {
+            isClosed = true;
+            pCapWriter.close();
+            logger.debug("PcapWriterHandler is now closed");
+        }
+    }
+
+    private enum ChannelType {
+        TCP, UDP
+    }
+
+    /**
+     * Builder for {@link PcapWriteHandler}.
+     */
+    public static final class Builder {
+        private boolean captureZeroByte;
+        private boolean writePcapGlobalHeader = true;
+
+        private ChannelType channelType;
+        private InetSocketAddress initiatiorAddr;
+        private InetSocketAddress handlerAddr;
+        private boolean isServerPipeline;
+
+        private Builder() {
+        }
+
+        /**
+         * Set to {@code true} to enable capturing packets with empty (0 bytes) payload. Otherwise, if set to
+         * {@code false}, empty packets will be filtered out.
+         *
+         * @param captureZeroByte Whether to filter out empty packets.
+         * @return this builder
+         */
+        public Builder captureZeroByte(boolean captureZeroByte) {
+            this.captureZeroByte = captureZeroByte;
+            return this;
+        }
+
+        /**
+         * Set to {@code true} to write Pcap Global Header on initialization. Otherwise, if set to {@code false}, Pcap
+         * Global Header will not be written on initialization. This could when writing Pcap data on a existing file
+         * where Pcap Global Header is already present.
+         *
+         * @param writePcapGlobalHeader Whether to write the pcap global header.
+         * @return this builder
+         */
+        public Builder writePcapGlobalHeader(boolean writePcapGlobalHeader) {
+            this.writePcapGlobalHeader = writePcapGlobalHeader;
+            return this;
+        }
+
+        /**
+         * Force this handler to write data as if they were TCP packets, with the given connection metadata. If this
+         * method isn't called, we determine the metadata from the channel.
+         *
+         * @param serverAddress The address of the TCP server (handler)
+         * @param clientAddress The address of the TCP client (initiator)
+         * @param localIsServer Whether the handler is part of the server channel
+         * @return this builder
+         */
+        public Builder forceTcpChannel(
+                InetSocketAddress serverAddress,
+                InetSocketAddress clientAddress,
+                boolean localIsServer) {
+            channelType = ChannelType.TCP;
+            handlerAddr = ObjectUtil.checkNotNull(serverAddress, "serverAddress");
+            initiatiorAddr = ObjectUtil.checkNotNull(clientAddress, "clientAddress");
+            isServerPipeline = localIsServer;
+            return this;
+        }
+
+        /**
+         * Force this handler to write data as if they were UDP packets, with the given connection metadata. If this
+         * method isn't called, we determine the metadata from the channel.
+         * <br>
+         * Note that even if this method is called, the address information on {@link DatagramPacket} takes precedence
+         * if it is present.
+         *
+         * @param localAddress  The address of the UDP local
+         * @param remoteAddress The address of the UDP remote
+         * @return this builder
+         */
+        public Builder forceUdpChannel(InetSocketAddress localAddress, InetSocketAddress remoteAddress) {
+            channelType = ChannelType.UDP;
+            handlerAddr = ObjectUtil.checkNotNull(remoteAddress, "remoteAddress");
+            initiatiorAddr = ObjectUtil.checkNotNull(localAddress, "localAddress");
+            return this;
+        }
+
+        /**
+         * Build the {@link PcapWriteHandler}.
+         *
+         * @param outputStream The output stream to write the pcap data to.
+         * @return The handler.
+         */
+        public PcapWriteHandler build(OutputStream outputStream) {
+            ObjectUtil.checkNotNull(outputStream, "outputStream");
+            return new PcapWriteHandler(this, outputStream);
+        }
     }
 }

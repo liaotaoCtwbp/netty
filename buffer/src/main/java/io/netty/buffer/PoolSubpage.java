@@ -5,7 +5,7 @@
  * version 2.0 (the "License"); you may not use this file except in compliance
  * with the License. You may obtain a copy of the License at:
  *
- *   http://www.apache.org/licenses/LICENSE-2.0
+ *   https://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
@@ -16,6 +16,8 @@
 
 package io.netty.buffer;
 
+import java.util.concurrent.locks.ReentrantLock;
+
 import static io.netty.buffer.PoolChunk.RUN_OFFSET_SHIFT;
 import static io.netty.buffer.PoolChunk.SIZE_SHIFT;
 import static io.netty.buffer.PoolChunk.IS_USED_SHIFT;
@@ -25,6 +27,7 @@ import static io.netty.buffer.SizeClasses.LOG2_QUANTUM;
 final class PoolSubpage<T> implements PoolSubpageMetric {
 
     final PoolChunk<T> chunk;
+    final int elemSize;
     private final int pageShifts;
     private final int runOffset;
     private final int runSize;
@@ -34,11 +37,12 @@ final class PoolSubpage<T> implements PoolSubpageMetric {
     PoolSubpage<T> next;
 
     boolean doNotDestroy;
-    int elemSize;
     private int maxNumElems;
     private int bitmapLength;
     private int nextAvail;
     private int numAvail;
+
+    private final ReentrantLock lock = new ReentrantLock();
 
     // TODO: Test if adding padding helps under contention
     //private long pad0, pad1, pad2, pad3, pad4, pad5, pad6, pad7;
@@ -60,10 +64,7 @@ final class PoolSubpage<T> implements PoolSubpageMetric {
         this.runSize = runSize;
         this.elemSize = elemSize;
         bitmap = new long[runSize >>> 6 + LOG2_QUANTUM]; // runSize / 64 / QUANTUM
-        init(head, elemSize);
-    }
 
-    void init(PoolSubpage<T> head, int elemSize) {
         doNotDestroy = true;
         if (elemSize != 0) {
             maxNumElems = numAvail = runSize / elemSize;
@@ -71,10 +72,6 @@ final class PoolSubpage<T> implements PoolSubpageMetric {
             bitmapLength = maxNumElems >>> 6;
             if ((maxNumElems & 63) != 0) {
                 bitmapLength ++;
-            }
-
-            for (int i = 0; i < bitmapLength; i ++) {
-                bitmap[i] = 0;
             }
         }
         addToPool(head);
@@ -89,6 +86,12 @@ final class PoolSubpage<T> implements PoolSubpageMetric {
         }
 
         final int bitmapIdx = getNextAvail();
+        if (bitmapIdx < 0) {
+            removeFromPool(); // Subpage appear to be in an invalid state. Remove to prevent repeated errors.
+            throw new AssertionError("No next available bitmap index found (bitmapIdx = " + bitmapIdx + "), " +
+                    "even though there are supposed to be (numAvail = " + numAvail + ") " +
+                    "out of (maxNumElems = " + maxNumElems + ") available indexes.");
+        }
         int q = bitmapIdx >>> 6;
         int r = bitmapIdx & 63;
         assert (bitmap[q] >>> r & 1) == 0;
@@ -118,7 +121,13 @@ final class PoolSubpage<T> implements PoolSubpageMetric {
 
         if (numAvail ++ == 0) {
             addToPool(head);
-            return true;
+            /* When maxNumElems == 1, the maximum numAvail is also 1.
+             * Each of these PoolSubpages will go in here when they do free operation.
+             * If they return true directly from here, then the rest of the code will be unreachable
+             * and they will not actually be recycled. So return true only on maxNumElems > 1. */
+            if (maxNumElems > 1) {
+                return true;
+            }
         }
 
         if (numAvail != maxNumElems) {
@@ -218,7 +227,8 @@ final class PoolSubpage<T> implements PoolSubpageMetric {
             numAvail = 0;
             elemSize = -1;
         } else {
-            synchronized (chunk.arena) {
+            chunk.arena.lock();
+            try {
                 if (!this.doNotDestroy) {
                     doNotDestroy = false;
                     // Not used for creating the String.
@@ -229,6 +239,8 @@ final class PoolSubpage<T> implements PoolSubpageMetric {
                     numAvail = this.numAvail;
                     elemSize = this.elemSize;
                 }
+            } finally {
+                chunk.arena.unlock();
             }
         }
 
@@ -246,9 +258,11 @@ final class PoolSubpage<T> implements PoolSubpageMetric {
             // It's the head.
             return 0;
         }
-
-        synchronized (chunk.arena) {
+        chunk.arena.lock();
+        try {
             return maxNumElems;
+        } finally {
+            chunk.arena.unlock();
         }
     }
 
@@ -259,8 +273,11 @@ final class PoolSubpage<T> implements PoolSubpageMetric {
             return 0;
         }
 
-        synchronized (chunk.arena) {
+        chunk.arena.lock();
+        try {
             return numAvail;
+        } finally {
+            chunk.arena.unlock();
         }
     }
 
@@ -271,8 +288,11 @@ final class PoolSubpage<T> implements PoolSubpageMetric {
             return -1;
         }
 
-        synchronized (chunk.arena) {
+        chunk.arena.lock();
+        try {
             return elemSize;
+        } finally {
+            chunk.arena.unlock();
         }
     }
 
@@ -285,5 +305,13 @@ final class PoolSubpage<T> implements PoolSubpageMetric {
         if (chunk != null) {
             chunk.destroy();
         }
+    }
+
+    void lock() {
+        lock.lock();
+    }
+
+    void unlock() {
+        lock.unlock();
     }
 }
